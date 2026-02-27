@@ -1,0 +1,54 @@
+seed: 42
+device: auto
+
+dataset:
+  train:
+    img_dir: Dataset/train
+    ann_file: Dataset/train/annotations/annotations.json
+  val:
+    img_dir: Dataset/val
+    ann_file: Dataset/val/annotations/annotations.json
+
+model:
+  num_classes: 4
+  pretrained: true
+  class_names:
+    - Background
+    - Chair
+    - Person
+    - Table
+
+dataloader:
+  batch_size: 4
+  shuffle: true
+  num_workers: 0
+
+optimizer:
+  name: SGD
+  lr: 0.005
+  momentum: 0.9
+  weight_decay: 0.0005
+
+scheduler:
+  enabled: true
+  step_size: 3
+  gamma: 0.1
+
+train:
+  num_epochs: 5
+
+output:
+  dir: outputs
+  save_every: 1
+  checkpoint_pattern: fasterrcnn_resnet50_epoch_{epoch}.pth
+  final_model_name: fasterrcnn_final.pth
+
+inference:
+  checkpoint_path: outputs/fasterrcnn_final.pth
+  image_path: test.jpg
+  image_dir: ""
+  output_dir: outputs/predictions
+  score_threshold: 0.5
+  show: true
+  save: true
+  figsize: [12, 10]
