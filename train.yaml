@@ -42,13 +42,3 @@ output:
   save_every: 1
   checkpoint_pattern: fasterrcnn_resnet50_epoch_{epoch}.pth
   final_model_name: fasterrcnn_final.pth
-
-inference:
-  checkpoint_path: outputs/fasterrcnn_final.pth
-  image_path: test.jpg
-  image_dir: ""
-  output_dir: outputs/predictions
-  score_threshold: 0.5
-  show: true
-  save: true
-  figsize: [12, 10]

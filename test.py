@@ -122,10 +122,20 @@ def draw_and_save(
 def main():
     parser = argparse.ArgumentParser(description="Run inference with trained Faster R-CNN")
     parser.add_argument("--config", type=str, default="train.yaml", help="Path to YAML config")
-    parser.add_argument("--image", type=str, default="", help="Optional single image override")
-    parser.add_argument("--image-dir", type=str, default="", help="Optional directory override")
-    parser.add_argument("--checkpoint", type=str, default="", help="Optional checkpoint override")
+    parser.add_argument("--checkpoint", type=str, required=True, help="Path to trained model checkpoint (.pth)")
+    parser.add_argument("--image", type=str, default="", help="Single image path")
+    parser.add_argument("--image-dir", type=str, default="", help="Directory containing images")
+    parser.add_argument("--output-dir", type=str, default="outputs/predictions", help="Directory for saved predictions")
+    parser.add_argument("--score-threshold", type=float, default=0.5, help="Confidence threshold")
+    parser.add_argument("--figsize", type=float, nargs=2, default=[12, 10], metavar=("W", "H"), help="Figure size")
+    parser.add_argument("--show", action="store_true", help="Display prediction plots")
+    parser.add_argument("--save", dest="save", action="store_true", help="Save prediction images")
+    parser.add_argument("--no-save", dest="save", action="store_false", help="Do not save prediction images")
+    parser.set_defaults(save=True)
     args = parser.parse_args()
+
+    if not args.image and not args.image_dir:
+        raise ValueError("Provide at least one input: --image or --image-dir")
 
     cfg = load_yaml(Path(args.config))
 
@@ -136,32 +146,25 @@ def main():
         device = torch.device(device_cfg)
 
     model_cfg = cfg["model"]
-    infer_cfg = cfg.get("inference", {})
-
-    checkpoint_path = args.checkpoint or infer_cfg.get("checkpoint_path")
-    if not checkpoint_path:
-        raise ValueError("No checkpoint path provided. Set inference.checkpoint_path or use --checkpoint.")
 
     model = get_model(
         num_classes=int(model_cfg["num_classes"]),
         pretrained=bool(model_cfg.get("pretrained", True)),
     )
-    state = torch.load(checkpoint_path, map_location=device)
+    state = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(state)
     model.to(device)
     model.eval()
 
-    image_path_cfg = infer_cfg.get("image_path", "")
-    image_dir_cfg = infer_cfg.get("image_dir", "")
-    image_paths = collect_images(args.image or image_path_cfg, args.image_dir or image_dir_cfg)
+    image_paths = collect_images(args.image, args.image_dir)
     if not image_paths:
-        raise ValueError("No input images found. Set inference.image_path/image_dir or pass --image/--image-dir.")
+        raise ValueError("No input images found from --image/--image-dir")
 
-    output_dir = Path(infer_cfg.get("output_dir", "outputs/predictions"))
-    threshold = float(infer_cfg.get("score_threshold", 0.5))
-    show_plot = bool(infer_cfg.get("show", True))
-    save_plot = bool(infer_cfg.get("save", True))
-    figsize = infer_cfg.get("figsize", [12, 10])
+    output_dir = Path(args.output_dir)
+    threshold = float(args.score_threshold)
+    show_plot = bool(args.show)
+    save_plot = bool(args.save)
+    figsize = args.figsize
     class_names = model_cfg.get("class_names", [])
 
     with torch.no_grad():
