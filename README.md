@@ -5,7 +5,7 @@ This project trains and tests a Faster R-CNN (ResNet-50 FPN) model using COCO-fo
 ## Files
 
 - `train.py`: Trains the model using config values from `train.yaml`.
-- `test.py`: Runs inference on image(s) using command-line arguments.
+- `test.py`: Runs inference on image(s) or video using only command-line arguments.
 - `train.yaml`: Central config for training dataset paths, model setup, optimizer/scheduler, and output settings.
 - `requirements.txt`: Python dependencies.
 
@@ -46,33 +46,39 @@ By default, checkpoints are saved to `outputs/`.
 
 ## Test (Inference)
 
-Single image:
+### Image
 
 ```bash
-python test.py --config train.yaml --checkpoint outputs/fasterrcnn_final.pth --image test.jpg
+python test.py --checkpoint outputs/fasterrcnn_final.pth --image test.jpg
 ```
 
-Run on a directory:
+### Image directory
 
 ```bash
-python test.py --config train.yaml --checkpoint outputs/fasterrcnn_final.pth --image-dir path/to/images
+python test.py --checkpoint outputs/fasterrcnn_final.pth --image-dir path/to/images
 ```
 
-Optional test arguments:
+### Video
 
-- `--output-dir outputs/predictions`
+```bash
+python test.py --checkpoint outputs/fasterrcnn_final.pth --video input.mp4 --video-output outputs/predictions/output.mp4
+```
+
+### Common optional args
+
+- `--num-classes 4`
+- `--class-names Background Chair Person Table`
+- `--device auto`
 - `--score-threshold 0.5`
-- `--figsize 12 10`
 - `--show`
 - `--no-save`
 
-## Configuration
+For image mode only:
 
-Edit `train.yaml` to change:
+- `--output-dir outputs/predictions`
+- `--figsize 12 10`
 
-- Dataset paths
-- Number of classes and class names
-- Batch size and workers
-- Optimizer/scheduler settings
-- Epoch count
-- Output/checkpoint naming
+## Notes
+
+- `test.py` does not read `train.yaml`.
+- Video inference requires OpenCV.

@@ -3,3 +3,4 @@ torchvision
 PyYAML
 matplotlib
 Pillow
+opencv-python
