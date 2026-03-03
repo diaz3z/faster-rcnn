@@ -1,84 +1,119 @@
-# Faster R-CNN Training and Inference
+# Faster R-CNN (Train + Inference)
 
-This project trains and tests a Faster R-CNN (ResNet-50 FPN) model using COCO-format annotations.
+This project trains and runs inference for Faster R-CNN (ResNet-50 FPN) on COCO-format datasets.
 
-## Files
+## Project Files
 
-- `train.py`: Trains the model using config values from `train.yaml`.
-- `test.py`: Runs inference on image(s) or video using only command-line arguments.
-- `train.yaml`: Central config for training dataset paths, model setup, optimizer/scheduler, and output settings.
+- `train.py`: Training script driven by `train.yaml`.
+- `train.yaml`: Training configuration (dataset, model, optimizer, scheduler, epochs, outputs).
+- `test.py`: Inference script for image, folder, video, and webcam.
 - `requirements.txt`: Python dependencies.
 
 ## Setup
 
-1. Create and activate a Python environment (recommended).
+1. Create and activate your environment.
 2. Install dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Dataset Format
+## Training
 
-Expected COCO-style layout (default in `train.yaml`):
-
-```text
-Dataset/
-  train/
-    annotations/
-      annotations.json
-    *.jpg / *.png ...
-  val/
-    annotations/
-      annotations.json
-    *.jpg / *.png ...
-```
-
-Update paths in `train.yaml` if your layout differs.
-
-## Train
+Run training:
 
 ```bash
 python train.py --config train.yaml
 ```
 
-By default, checkpoints are saved to `outputs/`.
+### What `train.py` does
 
-## Test (Inference)
+- Loads COCO dataset paths from `train.yaml`.
+- Reads `categories` from your COCO annotation file.
+- Builds a contiguous label map for Faster R-CNN:
+  - `cat_id_to_contig` (COCO category ID -> model class index)
+  - `contig_to_cat_id` (model class index -> COCO category ID)
+- Trains Faster R-CNN and saves checkpoints in `output.dir`.
+- Each checkpoint stores:
+  - `model_state`
+  - `num_classes`
+  - `class_names`
+  - `cat_id_to_contig`
+  - `contig_to_cat_id`
 
-### Image
+Saved files:
+
+- `outputs/fasterrcnn_epoch_<N>.pth`
+- `outputs/fasterrcnn_final.pth`
+
+## Inference (`test.py`)
+
+`test.py` does not read `train.yaml`.
+
+### 1) Single image
 
 ```bash
 python test.py --checkpoint outputs/fasterrcnn_final.pth --image test.jpg
 ```
 
-### Image directory
+### 2) Image folder
 
 ```bash
 python test.py --checkpoint outputs/fasterrcnn_final.pth --image-dir path/to/images
 ```
 
-### Video
+### 3) Video file
 
 ```bash
 python test.py --checkpoint outputs/fasterrcnn_final.pth --video input.mp4 --video-output outputs/predictions/output.mp4
 ```
 
-### Common optional args
+### 4) Webcam
 
-- `--num-classes 4`
-- `--class-names Background Chair Person Table`
-- `--device auto`
+```bash
+python test.py --checkpoint outputs/fasterrcnn_final.pth --webcam --webcam-index 0 --webcam-output outputs/predictions/webcam.mp4
+```
+
+Press `q` to quit webcam/video display window.
+
+## Inference Arguments
+
+Required:
+
+- `--checkpoint PATH`
+
+Input mode (choose one):
+
+- `--image PATH`
+- `--image-dir PATH`
+- `--video PATH`
+- `--webcam`
+
+Common optional:
+
+- `--device auto|cpu|cuda`
 - `--score-threshold 0.5`
 - `--show`
-- `--no-save`
+- `--save` / `--no-save`
 
-For image mode only:
+Image mode optional:
 
 - `--output-dir outputs/predictions`
 - `--figsize 12 10`
 
-## Notes
+Video mode optional:
 
-- `test.py` does not read `train.yaml`.
-- Video inference requires OpenCV.
+- `--video-output outputs/predictions/pred_video.mp4`
+
+Webcam mode optional:
+
+- `--webcam-index 0`
+- `--webcam-output outputs/predictions/pred_webcam.mp4`
+
+Advanced optional:
+
+- `--num-classes N`
+- `--class-names name0 name1 ...`
+- `--pretrained-backbone`
+
+Note: `test.py` loads metadata from checkpoint when available and may override `--num-classes` / `--class-names` if checkpoint values are more accurate.
