@@ -1,6 +1,6 @@
 import argparse
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import torch
@@ -50,7 +50,7 @@ def collect_images(single_image: str, image_dir: str) -> List[Path]:
         for ext in ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.webp"):
             images.extend(sorted(d.glob(ext)))
 
-    unique = []
+    unique: List[Path] = []
     seen = set()
     for p in images:
         key = str(p.resolve())
@@ -64,6 +64,110 @@ def get_class_name(class_id: int, class_names: List[str]) -> str:
     if 0 <= class_id < len(class_names):
         return class_names[class_id]
     return f"Class_{class_id}"
+
+
+def unwrap_checkpoint(obj: Any) -> Tuple[dict, dict]:
+    """
+    Returns state_dict, meta
+
+    Supported formats:
+      1) pure state_dict
+      2) {"model": state_dict, ...}
+      3) {"state_dict": state_dict, ...}
+      4) {"model_state_dict": state_dict, ...}
+      5) {"model_state": state_dict, ...}   new
+    """
+    if not isinstance(obj, dict):
+        raise TypeError("Checkpoint must be a dict or a state_dict-like dict")
+
+    def looks_like_state_dict(d: dict) -> bool:
+        if not d:
+            return False
+        k = next(iter(d.keys()))
+        return isinstance(k, str) and (
+            "roi_heads" in k or "backbone" in k or "rpn" in k or "transform" in k
+        )
+
+    if looks_like_state_dict(obj):
+        return obj, {}
+
+    for k in ("model", "state_dict", "model_state_dict", "model_state"):
+        v = obj.get(k)
+        if isinstance(v, dict) and looks_like_state_dict(v):
+            return v, {kk: vv for kk, vv in obj.items() if kk != k}
+
+    # If it is a dict but not a known wrapper, treat it as meta not state_dict
+    raise KeyError(
+        "Checkpoint dict did not contain a model state under keys model, state_dict, "
+        "model_state_dict, or model_state"
+    )
+
+
+# def unwrap_checkpoint(obj: Any) -> Tuple[dict, dict]:
+#     """
+#     Returns state_dict, meta
+
+#     Supported formats:
+#       1) pure state_dict
+#       2) {"model": state_dict, ...}
+#       3) {"state_dict": state_dict, ...}
+#       4) {"model_state_dict": state_dict, ...}
+#     meta contains everything else (potentially including class names if you saved them).
+#     """
+#     if not isinstance(obj, dict):
+#         raise TypeError("Checkpoint must be a dict or a state_dict-like dict")
+
+#     def looks_like_state_dict(d: dict) -> bool:
+#         if not d:
+#             return False
+#         k = next(iter(d.keys()))
+#         return isinstance(k, str) and (
+#             "roi_heads" in k or "backbone" in k or "rpn" in k or "transform" in k
+#         )
+
+#     if looks_like_state_dict(obj):
+#         return obj, {}
+
+#     for k in ("model", "state_dict", "model_state_dict"):
+#         v = obj.get(k)
+#         if isinstance(v, dict):
+#             return v, {kk: vv for kk, vv in obj.items() if kk != k}
+
+#     # Fallback: treat entire dict as state_dict
+#     return obj, {}
+
+
+def infer_num_classes_from_state_dict(state_dict: dict) -> int:
+    key = "roi_heads.box_predictor.cls_score.weight"
+    if key not in state_dict:
+        raise KeyError(
+            f"Could not find {key} in checkpoint. Keys example: {list(state_dict.keys())[:10]}"
+        )
+    # weight shape [num_classes, 1024]
+    return int(state_dict[key].shape[0])
+
+
+def extract_class_names_from_meta(meta: dict) -> Optional[List[str]]:
+    """
+    Works only if you saved names in the checkpoint dict during training.
+    Common keys: class_names, classes, categories, labels, label_map
+    """
+    for k in ("class_names", "classes", "categories", "labels"):
+        v = meta.get(k)
+        if isinstance(v, list) and v and all(isinstance(x, str) for x in v):
+            return v
+
+    lm = meta.get("label_map") or meta.get("labelmap")
+    if isinstance(lm, dict) and lm:
+        # id -> name
+        if all(isinstance(k, int) for k in lm.keys()) and all(isinstance(v, str) for v in lm.values()):
+            return [lm[i] for i in sorted(lm.keys())]
+        # name -> id
+        if all(isinstance(k, str) for k in lm.keys()) and all(isinstance(v, int) for v in lm.values()):
+            inv = {v: k for k, v in lm.items()}
+            return [inv[i] for i in sorted(inv.keys())]
+
+    return None
 
 
 def draw_and_save_image(
@@ -164,7 +268,7 @@ def run_video_inference(
     save_output: bool,
 ):
     if cv2 is None:
-        raise ImportError("OpenCV is required for video inference. Install it with: pip install opencv-python")
+        raise ImportError("OpenCV is required for video inference. Install it with pip install opencv-python")
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -193,7 +297,14 @@ def run_video_inference(
                 break
 
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            tensor = torch.from_numpy(frame_rgb).permute(2, 0, 1).float().div(255.0).unsqueeze(0).to(device)
+            tensor = (
+                torch.from_numpy(frame_rgb)
+                .permute(2, 0, 1)
+                .float()
+                .div(255.0)
+                .unsqueeze(0)
+                .to(device)
+            )
             prediction = model(tensor)[0]
 
             annotated_frame, kept = draw_boxes_on_frame(
@@ -228,9 +339,94 @@ def run_video_inference(
     print(f"Video processed. frames={frame_idx}, detections_above_threshold={total_kept}")
 
 
+def run_webcam_inference(
+    model,
+    device: torch.device,
+    webcam_index: int,
+    webcam_output: str,
+    class_names: List[str],
+    threshold: float,
+    show_plot: bool,
+    save_output: bool,
+):
+    if cv2 is None:
+        raise ImportError("OpenCV is required for webcam inference. Install it with pip install opencv-python")
+
+    cap = cv2.VideoCapture(webcam_index)
+    if not cap.isOpened():
+        raise ValueError(f"Could not open webcam index: {webcam_index}")
+
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = float(cap.get(cv2.CAP_PROP_FPS))
+    if fps <= 0:
+        fps = 25.0
+
+    writer = None
+    if save_output:
+        output_path = Path(webcam_output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+
+    frame_idx = 0
+    total_kept = 0
+
+    with torch.no_grad():
+        while True:
+            ret, frame_bgr = cap.read()
+            if not ret:
+                print("Webcam frame read failed. Exiting.")
+                break
+
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            tensor = (
+                torch.from_numpy(frame_rgb)
+                .permute(2, 0, 1)
+                .float()
+                .div(255.0)
+                .unsqueeze(0)
+                .to(device)
+            )
+            prediction = model(tensor)[0]
+
+            annotated_frame, kept = draw_boxes_on_frame(
+                frame_bgr=frame_bgr,
+                prediction=prediction,
+                class_names=class_names,
+                threshold=threshold,
+            )
+
+            total_kept += kept
+            frame_idx += 1
+
+            if writer is not None:
+                writer.write(annotated_frame)
+
+            if show_plot:
+                cv2.imshow("Webcam Inference press q to quit", annotated_frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+
+            if frame_idx % 60 == 0:
+                print(f"Processed {frame_idx} frames")
+
+    cap.release()
+    if writer is not None:
+        writer.release()
+    if show_plot:
+        cv2.destroyAllWindows()
+
+    if save_output:
+        print(f"Webcam video saved: {webcam_output}")
+    print(f"Webcam processed. frames={frame_idx}, detections_above_threshold={total_kept}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run inference with trained Faster R-CNN")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to trained model checkpoint (.pth)")
+
+    # Keep args, but they will be overridden by checkpoint if mismatched
     parser.add_argument("--num-classes", type=int, default=4, help="Total classes including background")
     parser.add_argument(
         "--class-names",
@@ -238,6 +434,7 @@ def main():
         default=["Background", "Chair", "Person", "Table"],
         help="Class names by index order (0..N-1)",
     )
+
     parser.add_argument(
         "--device",
         type=str,
@@ -258,12 +455,21 @@ def main():
         help="Output path for annotated video",
     )
 
+    parser.add_argument("--webcam", action="store_true", help="Run inference on webcam feed")
+    parser.add_argument("--webcam-index", type=int, default=0, help="Webcam device index")
+    parser.add_argument(
+        "--webcam-output",
+        type=str,
+        default="outputs/predictions/pred_webcam.mp4",
+        help="Output path for annotated webcam video",
+    )
+
     parser.add_argument("--output-dir", type=str, default="outputs/predictions", help="Directory for saved predictions")
     parser.add_argument("--score-threshold", type=float, default=0.5, help="Confidence threshold")
     parser.add_argument("--figsize", type=float, nargs=2, default=[12, 10], metavar=("W", "H"), help="Figure size")
-    parser.add_argument("--show", action="store_true", help="Display prediction plots/video")
-    parser.add_argument("--save", dest="save", action="store_true", help="Save prediction images/video")
-    parser.add_argument("--no-save", dest="save", action="store_false", help="Do not save prediction images/video")
+    parser.add_argument("--show", action="store_true", help="Display prediction plots or video windows")
+    parser.add_argument("--save", dest="save", action="store_true", help="Save prediction images or video")
+    parser.add_argument("--no-save", dest="save", action="store_false", help="Do not save prediction images or video")
     parser.set_defaults(save=True)
     args = parser.parse_args()
 
@@ -272,14 +478,56 @@ def main():
     else:
         device = torch.device(args.device)
 
+    # Load checkpoint first so we can auto-infer num_classes (and maybe class names)
+    ckpt_obj = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+    state_dict, meta = unwrap_checkpoint(ckpt_obj)
+
+    ckpt_num_classes = infer_num_classes_from_state_dict(state_dict)
+    if args.num_classes != ckpt_num_classes:
+        print(f"Checkpoint classes={ckpt_num_classes}. Overriding --num-classes {args.num_classes} -> {ckpt_num_classes}")
+        args.num_classes = ckpt_num_classes
+
+    ckpt_class_names = extract_class_names_from_meta(meta)
+    if ckpt_class_names and len(ckpt_class_names) == args.num_classes:
+        args.class_names = ckpt_class_names
+        print(f"Loaded class names from checkpoint: {args.class_names}")
+    else:
+        if ckpt_class_names and len(ckpt_class_names) != args.num_classes:
+            print(
+                f"Checkpoint provided class names length={len(ckpt_class_names)} but num_classes={args.num_classes}. "
+                "Ignoring checkpoint class names."
+            )
+
+        if len(args.class_names) != args.num_classes:
+            print(
+                f"--class-names length={len(args.class_names)} does not match num_classes={args.num_classes}. "
+                "Auto-generating placeholder names."
+            )
+            args.class_names = [f"Class_{i}" for i in range(args.num_classes)]
+            if args.num_classes > 0:
+                args.class_names[0] = "Background"
+
     model = get_model(num_classes=args.num_classes, pretrained_backbone=bool(args.pretrained_backbone))
-    state = torch.load(args.checkpoint, map_location=device)
-    model.load_state_dict(state)
+    model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
 
     threshold = float(args.score_threshold)
     class_names = args.class_names
+
+    if args.webcam:
+        # Webcam is interactive, showing window is the default expectation.
+        run_webcam_inference(
+            model=model,
+            device=device,
+            webcam_index=int(args.webcam_index),
+            webcam_output=str(args.webcam_output),
+            class_names=class_names,
+            threshold=threshold,
+            show_plot=True if args.show else True,
+            save_output=bool(args.save),
+        )
+        return
 
     if args.video:
         run_video_inference(
@@ -295,7 +543,7 @@ def main():
         return
 
     if not args.image and not args.image_dir:
-        raise ValueError("Provide at least one input: --image, --image-dir, or --video")
+        raise ValueError("Provide at least one input: --image, --image-dir, --video, or --webcam")
 
     image_paths = collect_images(args.image, args.image_dir)
     if not image_paths:

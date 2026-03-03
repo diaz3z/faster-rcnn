@@ -3,20 +3,19 @@ device: auto
 
 dataset:
   train:
-    img_dir: Dataset/train
-    ann_file: Dataset/train/annotations/annotations.json
+    img_dir: D:\ZAID\Face Detection.v27i.coco\train
+    ann_file: D:\ZAID\Face Detection.v27i.coco\train\_annotations.coco.json
   val:
-    img_dir: Dataset/val
-    ann_file: Dataset/val/annotations/annotations.json
+    img_dir: D:\ZAID\Face Detection.v27i.coco\valid
+    ann_file: D:\ZAID\Face Detection.v27i.coco\valid\_annotations.coco.json
 
 model:
-  num_classes: 4
+  num_classes: 3
   pretrained: true
   class_names:
     - Background
-    - Chair
-    - Person
-    - Table
+    - faces
+    - face
 
 dataloader:
   batch_size: 4

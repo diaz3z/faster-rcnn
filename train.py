@@ -1,7 +1,8 @@
 import argparse
+import json
 import random
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torchvision
@@ -9,6 +10,7 @@ import yaml
 from torch.utils.data import DataLoader
 from torchvision.datasets import CocoDetection
 from torchvision.transforms import functional as F
+from tqdm import tqdm
 
 
 class CocoTransform:
@@ -22,16 +24,11 @@ def load_yaml(path: Path) -> Dict[str, Any]:
         return yaml.safe_load(f)
 
 
-def get_coco_dataset(img_dir: str, ann_file: str) -> CocoDetection:
-    return CocoDetection(root=img_dir, annFile=ann_file, transforms=CocoTransform())
-
-
 def collate_fn(batch):
     return tuple(zip(*batch))
 
 
 def get_model(num_classes: int, pretrained: bool = True):
-    # Supports both old and newer torchvision APIs.
     try:
         weights = (
             torchvision.models.detection.FasterRCNN_ResNet50_FPN_Weights.DEFAULT
@@ -49,7 +46,53 @@ def get_model(num_classes: int, pretrained: bool = True):
     return model
 
 
-def build_targets(targets: List[Any], device: torch.device):
+def read_coco_categories(ann_file: str) -> List[Dict[str, Any]]:
+    with open(ann_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    cats = data.get("categories", [])
+    if not cats:
+        raise ValueError(f"No categories found in {ann_file}")
+    return cats
+
+
+def build_label_maps_from_coco(ann_file: str):
+    cats = read_coco_categories(ann_file)
+    cats_sorted = sorted(cats, key=lambda c: int(c["id"]))
+
+    class_names = ["__background__"] + [str(c["name"]) for c in cats_sorted]
+
+    cat_id_to_contig = {}
+    contig_to_cat_id = {}
+
+    for idx, c in enumerate(cats_sorted, start=1):
+        cat_id = int(c["id"])
+        cat_id_to_contig[cat_id] = idx
+        contig_to_cat_id[idx] = cat_id
+
+    return class_names, cat_id_to_contig, contig_to_cat_id
+
+
+def resolve_class_names_and_maps(ann_file, cfg_class_names, cfg_num_classes):
+    coco_class_names, cat_id_to_contig, contig_to_cat_id = build_label_maps_from_coco(
+        ann_file
+    )
+
+    class_names = cfg_class_names if cfg_class_names else coco_class_names
+    num_classes = len(class_names)
+
+    if cfg_num_classes is not None and int(cfg_num_classes) != num_classes:
+        raise ValueError(
+            f"num_classes mismatch cfg={cfg_num_classes} actual={num_classes}"
+        )
+
+    return class_names, cat_id_to_contig, contig_to_cat_id, num_classes
+
+
+def get_coco_dataset(img_dir: str, ann_file: str) -> CocoDetection:
+    return CocoDetection(root=img_dir, annFile=ann_file, transforms=CocoTransform())
+
+
+def build_targets(targets, device, cat_id_to_contig):
     processed_targets = []
     valid_indices = []
 
@@ -64,9 +107,16 @@ def build_targets(targets: List[Any], device: torch.device):
                 continue
 
             x, y, w, h = bbox
-            if w > 0 and h > 0:
-                boxes.append([x, y, x + w, y + h])
-                labels.append(int(category_id))
+            if w <= 0 or h <= 0:
+                continue
+
+            cat_id = int(category_id)
+            contig = cat_id_to_contig.get(cat_id)
+            if contig is None:
+                continue
+
+            boxes.append([x, y, x + w, y + h])
+            labels.append(contig)
 
         if boxes:
             processed_targets.append(
@@ -80,14 +130,29 @@ def build_targets(targets: List[Any], device: torch.device):
     return processed_targets, valid_indices
 
 
-def train_one_epoch(model, optimizer, data_loader, device, epoch: int) -> float:
+def train_one_epoch(
+    model,
+    optimizer,
+    data_loader,
+    device,
+    epoch,
+    cat_id_to_contig,
+):
     model.train()
     running_loss = 0.0
     steps = 0
 
-    for images, targets in data_loader:
+    progress_bar = tqdm(
+        data_loader,
+        desc=f"Epoch {epoch}",
+        leave=True,
+    )
+
+    for images, targets in progress_bar:
         images = [img.to(device) for img in images]
-        processed_targets, valid_indices = build_targets(list(targets), device)
+        processed_targets, valid_indices = build_targets(
+            list(targets), device, cat_id_to_contig
+        )
 
         if not processed_targets:
             continue
@@ -100,17 +165,42 @@ def train_one_epoch(model, optimizer, data_loader, device, epoch: int) -> float:
         losses.backward()
         optimizer.step()
 
-        running_loss += losses.item()
+        loss_value = float(losses.item())
+        running_loss += loss_value
         steps += 1
 
+        avg_loss = running_loss / steps
+        progress_bar.set_postfix(
+            loss=f"{loss_value:.4f}",
+            avg=f"{avg_loss:.4f}",
+        )
+
     avg_loss = running_loss / steps if steps > 0 else 0.0
-    print(f"Epoch [{epoch}] avg_loss={avg_loss:.4f} steps={steps}")
     return avg_loss
 
 
+def save_checkpoint(
+    path,
+    model,
+    num_classes,
+    class_names,
+    cat_id_to_contig,
+    contig_to_cat_id,
+):
+    ckpt = {
+        "model_state": model.state_dict(),
+        "num_classes": num_classes,
+        "class_names": class_names,
+        "cat_id_to_contig": cat_id_to_contig,
+        "contig_to_cat_id": contig_to_cat_id,
+    }
+    torch.save(ckpt, path)
+    print(f"Saved checkpoint {path}")
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Train Faster R-CNN from YAML config")
-    parser.add_argument("--config", type=str, default="train.yaml", help="Path to YAML config")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default="train.yaml")
     args = parser.parse_args()
 
     cfg = load_yaml(Path(args.config))
@@ -122,10 +212,11 @@ def main():
         torch.cuda.manual_seed_all(seed)
 
     device_cfg = str(cfg.get("device", "auto")).lower()
-    if device_cfg == "auto":
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device(device_cfg)
+    device = (
+        torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if device_cfg == "auto"
+        else torch.device(device_cfg)
+    )
 
     train_cfg = cfg["dataset"]["train"]
     val_cfg = cfg["dataset"].get("val")
@@ -134,6 +225,20 @@ def main():
     val_dataset = None
     if val_cfg and val_cfg.get("img_dir") and val_cfg.get("ann_file"):
         val_dataset = get_coco_dataset(val_cfg["img_dir"], val_cfg["ann_file"])
+
+    model_cfg = cfg["model"]
+
+    class_names, cat_id_to_contig, contig_to_cat_id, num_classes = (
+        resolve_class_names_and_maps(
+            ann_file=train_cfg["ann_file"],
+            cfg_class_names=model_cfg.get("class_names"),
+            cfg_num_classes=model_cfg.get("num_classes"),
+        )
+    )
+
+    model = get_model(num_classes=num_classes, pretrained=model_cfg.get("pretrained", True))
+    model.class_names = class_names
+    model.to(device)
 
     dl_cfg = cfg.get("dataloader", {})
     train_loader = DataLoader(
@@ -144,72 +249,57 @@ def main():
         collate_fn=collate_fn,
     )
 
-    if val_dataset is not None:
-        _ = DataLoader(
-            val_dataset,
-            batch_size=int(dl_cfg.get("batch_size", 4)),
-            shuffle=False,
-            num_workers=int(dl_cfg.get("num_workers", 0)),
-            collate_fn=collate_fn,
-        )
-
-    model_cfg = cfg["model"]
-    model = get_model(
-        num_classes=int(model_cfg["num_classes"]),
-        pretrained=bool(model_cfg.get("pretrained", True)),
-    )
-    model.to(device)
-
     opt_cfg = cfg["optimizer"]
     params = [p for p in model.parameters() if p.requires_grad]
-    opt_name = str(opt_cfg.get("name", "SGD")).lower()
-    if opt_name == "adam":
-        optimizer = torch.optim.Adam(
-            params,
-            lr=float(opt_cfg.get("lr", 1e-4)),
-            weight_decay=float(opt_cfg.get("weight_decay", 0.0)),
-        )
-    else:
-        optimizer = torch.optim.SGD(
-            params,
-            lr=float(opt_cfg.get("lr", 0.005)),
-            momentum=float(opt_cfg.get("momentum", 0.9)),
-            weight_decay=float(opt_cfg.get("weight_decay", 0.0005)),
-        )
+    optimizer = torch.optim.SGD(
+        params,
+        lr=float(opt_cfg.get("lr", 0.005)),
+        momentum=float(opt_cfg.get("momentum", 0.9)),
+        weight_decay=float(opt_cfg.get("weight_decay", 0.0005)),
+    )
 
-    scheduler = None
-    sch_cfg = cfg.get("scheduler", {})
-    if bool(sch_cfg.get("enabled", True)):
-        scheduler = torch.optim.lr_scheduler.StepLR(
-            optimizer,
-            step_size=int(sch_cfg.get("step_size", 3)),
-            gamma=float(sch_cfg.get("gamma", 0.1)),
-        )
+    scheduler = torch.optim.lr_scheduler.StepLR(
+        optimizer,
+        step_size=int(cfg.get("scheduler", {}).get("step_size", 3)),
+        gamma=float(cfg.get("scheduler", {}).get("gamma", 0.1)),
+    )
 
-    out_cfg = cfg.get("output", {})
-    output_dir = Path(out_cfg.get("dir", "outputs"))
+    output_dir = Path(cfg.get("output", {}).get("dir", "outputs"))
     output_dir.mkdir(parents=True, exist_ok=True)
-    save_every = int(out_cfg.get("save_every", 1))
-    ckpt_pattern = out_cfg.get("checkpoint_pattern", "fasterrcnn_resnet50_epoch_{epoch}.pth")
-    final_model_name = out_cfg.get("final_model_name", "fasterrcnn_final.pth")
 
     num_epochs = int(cfg.get("train", {}).get("num_epochs", 5))
 
     for epoch in range(1, num_epochs + 1):
-        train_one_epoch(model, optimizer, train_loader, device, epoch)
+        avg_loss = train_one_epoch(
+            model,
+            optimizer,
+            train_loader,
+            device,
+            epoch,
+            cat_id_to_contig,
+        )
 
-        if scheduler is not None:
-            scheduler.step()
+        scheduler.step()
 
-        if save_every > 0 and epoch % save_every == 0:
-            ckpt_name = ckpt_pattern.format(epoch=epoch)
-            ckpt_path = output_dir / ckpt_name
-            torch.save(model.state_dict(), ckpt_path)
-            print(f"Saved checkpoint: {ckpt_path}")
+        print(f"Epoch {epoch} completed avg_loss={avg_loss:.4f}")
 
-    final_path = output_dir / final_model_name
-    torch.save(model.state_dict(), final_path)
-    print(f"Saved final model: {final_path}")
+        save_checkpoint(
+            output_dir / f"fasterrcnn_epoch_{epoch}.pth",
+            model,
+            num_classes,
+            class_names,
+            cat_id_to_contig,
+            contig_to_cat_id,
+        )
+
+    save_checkpoint(
+        output_dir / "fasterrcnn_final.pth",
+        model,
+        num_classes,
+        class_names,
+        cat_id_to_contig,
+        contig_to_cat_id,
+    )
 
 
 if __name__ == "__main__":
