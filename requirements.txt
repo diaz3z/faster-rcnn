@@ -4,3 +4,4 @@ PyYAML
 matplotlib
 Pillow
 opencv-python
+tqdm
